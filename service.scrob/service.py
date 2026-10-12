@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -10,11 +11,11 @@ import xbmcvfs
 
 try:
     from urllib.request import Request, urlopen
-    from urllib.parse import quote
+    from urllib.parse import quote, unquote
     from urllib.error import HTTPError
 except ImportError:
     from urllib2 import Request, urlopen, HTTPError
-    from urllib import quote
+    from urllib import quote, unquote
 
 ADDON_ID = 'service.scrob'
 
@@ -36,6 +37,68 @@ def _settings():
         'rating_default': min(10, max(1, int(a.getSetting('rating_default') or 5))),
         'rate_episodes_on_completion': a.getSettingBool('rate_episodes_on_completion'),
     }
+
+
+# ── Excluded paths ────────────────────────────────────────────────────────────
+#
+# Playback of anything under an excluded folder or source is never sent to Scrob
+# (events, progress, mark-as-watched, ratings). The list is stored as a JSON array
+# in exclusions.json in the add-on profile, not in a Kodi setting: the settings
+# dialog keeps its own copy of the values and can discard changes made by a script.
+
+def _exclusions_path():
+    prof = xbmcvfs.translatePath(xbmcaddon.Addon(id=ADDON_ID).getAddonInfo('profile'))
+    if not xbmcvfs.exists(prof):
+        xbmcvfs.mkdirs(prof)
+    return os.path.join(prof, 'exclusions.json')
+
+
+def _load_exclusions():
+    try:
+        path = _exclusions_path()
+        if not xbmcvfs.exists(path):
+            return []
+        f = xbmcvfs.File(path)
+        try:
+            value = json.loads(f.read() or '[]')
+        finally:
+            f.close()
+    except Exception:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [e for e in value if isinstance(e, str) and e.strip()]
+
+
+def _norm_path(path):
+    p = (path or '').strip().replace('\\', '/').lower()
+    # Credentials embedded in URL-style paths (smb://user:pass@host/...) must not affect matching.
+    m = re.match(r'^([a-z][a-z0-9+.-]*://)(?:[^/@]*@)?(.*)$', p)
+    if m:
+        p = m.group(1) + m.group(2)
+    return p.rstrip('/')
+
+
+def _path_excluded(file_path, rules):
+    """True when file_path equals, or sits beneath, any normalised rule. A
+    stack:// path is excluded if any of its parts is."""
+    if not file_path:
+        return False
+    if file_path.startswith('stack://'):
+        parts = file_path[len('stack://'):].split(' , ')
+    else:
+        parts = [file_path]
+    for part in parts:
+        p = _norm_path(part)
+        for r in rules:
+            if p == r or p.startswith(r + '/'):
+                return True
+    return False
+
+
+def _is_excluded(item):
+    rules = [r for r in (_norm_path(p) for p in _load_exclusions()) if r]
+    return bool(rules) and _path_excluded((item or {}).get('_file'), rules)
 
 
 # ── Auth / HTTP ───────────────────────────────────────────────────────────────
@@ -315,10 +378,103 @@ def _update_connection_status():
         pass
 
 
+def _exclusions_summary_text():
+    n = len(_load_exclusions())
+    if not n:
+        return 'None - everything is scrobbled'
+    return '{} excluded path{}'.format(n, '' if n == 1 else 's')
+
+
+def _update_exclusions_summary():
+    try:
+        a = xbmcaddon.Addon(id=ADDON_ID)
+        text = _exclusions_summary_text()
+        if a.getSetting('excluded_summary') != text:
+            a.setSetting('excluded_summary', text)
+    except Exception:
+        pass
+
+
+def _save_exclusions(paths):
+    f = xbmcvfs.File(_exclusions_path(), 'w')
+    try:
+        f.write(json.dumps(paths))
+    finally:
+        f.close()
+    _update_exclusions_summary()
+
+
+def _expand_source(path):
+    # A Kodi source with several folders is a multipath:// of url-encoded entries.
+    if path.startswith('multipath://'):
+        return [unquote(p) for p in path[len('multipath://'):].split('/') if p]
+    return [path]
+
+
+def _pick_kodi_source():
+    dialog = xbmcgui.Dialog()
+    try:
+        sources = _kodi_rpc('Files.GetSources', {'media': 'video'}).get('sources', [])
+    except Exception:
+        sources = []
+    sources = [s for s in sources if s.get('file')]
+    if not sources:
+        dialog.notification('Scrob', 'No video sources found', xbmcgui.NOTIFICATION_INFO)
+        return []
+    idx = dialog.select('Kodi video sources', [u'{}  -  {}'.format(s.get('label', ''), s['file']) for s in sources])
+    return _expand_source(sources[idx]['file']) if idx >= 0 else []
+
+
+def _manage_exclusions():
+    dialog = xbmcgui.Dialog()
+    try:
+        while True:
+            paths = _load_exclusions()
+            entries = [('[Add folder...]', 'folder', None),
+                       ('[Add from Kodi sources...]', 'source', None)]
+            entries += [(p, 'remove', p) for p in paths]
+            if paths:
+                entries.append(('[Clear all]', 'clear', None))
+            entries.append(('[Done]', 'done', None))
+
+            idx = dialog.select('Scrob - excluded paths (select an entry to remove it)',
+                                [e[0] for e in entries])
+            if idx < 0 or entries[idx][1] == 'done':
+                break
+            _, kind, value = entries[idx]
+
+            if kind in ('folder', 'source'):
+                if kind == 'folder':
+                    picked = dialog.browseSingle(0, 'Folder to exclude from scrobbling', 'video')
+                    new = [picked] if picked else []
+                else:
+                    new = _pick_kodi_source()
+                known = set(_norm_path(p) for p in paths)
+                for p in new:
+                    if _norm_path(p) and _norm_path(p) not in known:
+                        paths.append(p)
+                        known.add(_norm_path(p))
+                _save_exclusions(paths)
+            elif kind == 'clear':
+                if dialog.yesno('Scrob', 'Remove all excluded paths?'):
+                    _save_exclusions([])
+            elif kind == 'remove':
+                if dialog.yesno('Scrob', u'Stop excluding:\n{}'.format(value)):
+                    paths.remove(value)
+                    _save_exclusions(paths)
+    finally:
+        _update_exclusions_summary()
+    n = len(_load_exclusions())
+    dialog.notification('Scrob', u'{} excluded path{} saved'.format(n, '' if n == 1 else 's'),
+                        xbmcgui.NOTIFICATION_INFO)
+
+
 # ── Scrobbling ────────────────────────────────────────────────────────────────
 
 def _post(method, item, player_state, ended=False, source=None):
     if not _settings()['sync_to_scrob']:
+        return
+    if _is_excluded(item):
         return
     # Keys starting with '_' are add-on-local (e.g. artwork for the rating
     # popup) and are not part of what Scrob is sent.
@@ -330,8 +486,11 @@ def _post(method, item, player_state, ended=False, source=None):
         payload['source'] = source
     if method == 'Player.OnStop':
         payload['params'] = {'data': {'end': ended}}
-    if _api('webhooks/kodi', payload) is not None:
-        xbmc.log('[service.scrob] {}'.format(method), xbmc.LOGDEBUG)
+    reply = _api('webhooks/kodi', payload)
+    if reply is not None:
+        xbmc.log(u'[service.scrob] {} {} -> {}'.format(
+            method, json.dumps(payload['item'], ensure_ascii=False),
+            json.dumps(reply, ensure_ascii=False)), xbmc.LOGDEBUG)
 
 
 def _post_rating(item, rating):
@@ -425,6 +584,8 @@ def _pick_rating(label, default, art=None):
 
 
 def _ask_and_post_rating(item):
+    if _is_excluded(item):
+        return
     xbmc.sleep(1500)
     if item['type'] == 'episode':
         label = '{} S{:02d}E{:02d}'.format(
@@ -573,12 +734,34 @@ def _progress_pct(player_state):
     return (_seconds(player_state.get('time')) / total) if total else 0.0
 
 
+_show_uid_cache = {}
+
+
+def _show_uniqueid(tvshowid):
+    """The TV show's own uniqueid. Scrob resolves an episode's series from
+    show-level ids; an episode's tvdb/imdb id never matches a series."""
+    if not isinstance(tvshowid, int) or tvshowid < 0:
+        return {}
+    uid = _show_uid_cache.get(tvshowid)
+    if uid is None:
+        try:
+            details = _kodi_rpc('VideoLibrary.GetTVShowDetails', {
+                'tvshowid': tvshowid, 'properties': ['uniqueid']}).get('tvshowdetails') or {}
+        except Exception:
+            details = {}
+        uid = details.get('uniqueid') or {}
+        if uid:
+            _show_uid_cache[tvshowid] = uid
+    return uid
+
+
 def _read_item(player):
     """Read the current player item via JSON-RPC and position. Returns (item, player_state) or (None, None)."""
     try:
         result = _kodi_rpc('Player.GetItem', {
             'playerid': 1,
-            'properties': ['title', 'showtitle', 'season', 'episode', 'year', 'uniqueid', 'art'],
+            'properties': ['title', 'showtitle', 'season', 'episode', 'year', 'uniqueid', 'art', 'file',
+                           'tvshowid'],
         })
         kodi_item = result.get('item', {})
     except Exception:
@@ -586,11 +769,15 @@ def _read_item(player):
 
     media_type = kodi_item.get('type', '')
     if media_type not in ('movie', 'episode'):
+        xbmc.log(u'[service.scrob] ignoring item of type {!r}: {}'.format(
+            media_type, kodi_item.get('label', '')), xbmc.LOGDEBUG)
         return None, None
 
     uid = kodi_item.get('uniqueid') or {}
-
-    item = {'type': media_type, 'uniqueid': uid, '_art': _pick_art(kodi_item.get('art'), media_type)}
+    if media_type == 'episode':
+        uid = _show_uniqueid(kodi_item.get('tvshowid')) or uid
+    item = {'type': media_type, 'uniqueid': uid, '_art': _pick_art(kodi_item.get('art'), media_type),
+            '_file': kodi_item.get('file', '')}
     if media_type == 'movie':
         item['title'] = kodi_item.get('title', '')
         item['year'] = kodi_item.get('year')
@@ -743,23 +930,26 @@ class ScrobMonitor(xbmc.Monitor):
         if lib_type == 'movie':
             d = _kodi_rpc('VideoLibrary.GetMovieDetails', {
                 'movieid': lib_id,
-                'properties': ['title', 'year', 'uniqueid', 'runtime'],
+                'properties': ['title', 'year', 'uniqueid', 'runtime', 'file'],
             }).get('moviedetails') or {}
             if not d:
                 return None, None
             item = {'type': 'movie', 'id': lib_id, 'uniqueid': d.get('uniqueid') or {},
-                    'title': d.get('title', ''), 'year': d.get('year')}
+                    'title': d.get('title', ''), 'year': d.get('year'), '_file': d.get('file', '')}
             runtime = int(d.get('runtime') or 0) or 3600
         else:
             d = _kodi_rpc('VideoLibrary.GetEpisodeDetails', {
                 'episodeid': lib_id,
-                'properties': ['title', 'showtitle', 'season', 'episode', 'uniqueid', 'runtime'],
+                'properties': ['title', 'showtitle', 'season', 'episode', 'uniqueid', 'runtime', 'file',
+                               'tvshowid'],
             }).get('episodedetails') or {}
             if not d:
                 return None, None
-            item = {'type': 'episode', 'id': lib_id, 'uniqueid': d.get('uniqueid') or {},
+            item = {'type': 'episode', 'id': lib_id,
+                    'uniqueid': _show_uniqueid(d.get('tvshowid')) or d.get('uniqueid') or {},
                     'title': d.get('title', ''), 'showtitle': d.get('showtitle', ''),
-                    'season': d.get('season', 0), 'episode': d.get('episode', 0)}
+                    'season': d.get('season', 0), 'episode': d.get('episode', 0),
+                    '_file': d.get('file', '')}
             runtime = int(d.get('runtime') or 0) or 1800
         return item, {'time': _hms(runtime), 'totaltime': _hms(runtime)}
 
@@ -788,7 +978,7 @@ class ScrobMonitor(xbmc.Monitor):
             return
 
         item, ps = self._library_item(lib_type, lib_id)
-        if not item:
+        if not item or _is_excluded(item):
             return
         # Already scrobbled as complete by the playback's own OnStop (or a
         # previous OnUpdate for the same title) — nothing to add.
@@ -802,6 +992,7 @@ class ScrobMonitor(xbmc.Monitor):
 
     def onSettingsChanged(self):
         _update_connection_status()
+        _update_exclusions_summary()
 
     def onNotification(self, sender, method, data):
         if method == 'Player.OnPlay':
@@ -875,6 +1066,7 @@ class ScrobMonitor(xbmc.Monitor):
 def run():
     xbmc.log('[service.scrob] Starting', xbmc.LOGINFO)
     _update_connection_status()
+    _update_exclusions_summary()
     monitor = ScrobMonitor()
     if _settings()['sync_from_scrob']:
         _sync_from_scrob(monitor)
@@ -899,5 +1091,7 @@ if _ACTION == 'authorize':
     _device_authorize()
 elif _ACTION == 'signout':
     _forget_authorization()
+elif _ACTION == 'exclusions':
+    _manage_exclusions()
 else:
     run()
