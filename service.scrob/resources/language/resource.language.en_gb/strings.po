@@ -88,3 +88,19 @@ msgstr ""
 msgctxt "#30025"
 msgid "Manage excluded paths"
 msgstr ""
+
+msgctxt "#30026"
+msgid "[Add video add-on...]"
+msgstr ""
+
+msgctxt "#30027"
+msgid "Video add-on to exclude"
+msgstr ""
+
+msgctxt "#30028"
+msgid "Could not list video add-ons"
+msgstr ""
+
+msgctxt "#30029"
+msgid "No video add-ons found"
+msgstr ""
