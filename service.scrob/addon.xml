@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<addon id="service.scrob" name="Scrob" version="1.4.0" provider-name="Scrob">
+<addon id="service.scrob" name="Scrob" version="1.4.1" provider-name="Scrob">
   <requires>
     <import addon="xbmc.python" version="3.0.0"/>
   </requires>
@@ -17,6 +17,9 @@
     <license>GPL-3.0-only</license>
     <source>https://github.com/ellite/scrob-kodi</source>
     <news>
+1.4.1
+- Fix exclusions for resolved plugin streams; add a video add-on picker to exclude an entire add-on
+
 1.4.0
 - New Excluded Paths setting: choose folders or Kodi video sources whose playback is never scrobbled to Scrob (events, progress, mark-as-watched, ratings and the rating popup)
 - Scrob now also appears under Program add-ons; opening it from there shows its settings
