@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1
+
+- Add normal-level playback diagnostics for unsupported Kodi media types, exclusions, disabled sending and request results, without logging stream URLs or credentials
+- Fix video add-on exclusions after Kodi resolves a plugin URL to a stream: check and retain the original playback source, including for progress, stop, library updates during playback and ratings. Add **Add video add-on...** to exclude every playback route of a selected add-on
+- Local PowerShell builds default to a separate **Scrob Test** add-on (`service.scrob.test`) with independent settings and authorization
+
 ## 1.4.0
 
 - New **Excluded Paths** setting: choose folders or Kodi video sources whose playback is never scrobbled to Scrob (events, progress, mark-as-watched, ratings and the rating popup). Manage the list from **Manage excluded paths** in the Sync settings; an entry covers the folder and everything beneath it
